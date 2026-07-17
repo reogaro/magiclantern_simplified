@@ -35,7 +35,7 @@
 #ifndef WIN32
 #include <sys/mman.h>
 #endif
-#include <usb.h>
+#include <libusb.h>
 
 #ifdef WIN32
 #define usleep(usec) Sleep((usec)/1000)
@@ -72,19 +72,6 @@
 #define MAXCONNRETRIES 10
 
 
-/* USB interface class */
-#ifndef USB_CLASS_PTP
-#define USB_CLASS_PTP		6
-#endif
-
-/* USB control message data phase direction */
-#ifndef USB_DP_HTD
-#define USB_DP_HTD		(0x00 << 7)	/* host to device */
-#endif
-#ifndef USB_DP_DTH
-#define USB_DP_DTH		(0x01 << 7)	/* device to host */
-#endif
-
 /* PTP class specific requests */
 #ifndef USB_REQ_DEVICE_RESET
 #define USB_REQ_DEVICE_RESET		0x66
@@ -97,6 +84,9 @@
 #ifndef USB_FEATURE_HALT
 #define USB_FEATURE_HALT	0x00
 #endif
+
+/* libusb-1.0 context */
+static libusb_context *ctx = NULL;
 
 /* OUR APPLICATION USB URB (2MB) ;) */
 #define PTPCAM_USB_URB		2097152
@@ -143,8 +133,12 @@ typedef struct
     uint32_t buffer_size;
     uint32_t current_buffer;
     uint32_t overflow;
-    ptpbuf_buffer_t *buffers;
-    uint32_t *fetchable;
+    /* These are 32-bit camera-side addresses, not host pointers.
+     * The camera is a 32-bit ARM device; storing them as pointers
+     * would be wrong on a 64-bit host since the struct is read
+     * verbatim from camera RAM via ptp_chdk_get_memory(). */
+    uint32_t buffers;    /* camera address of buffer array */
+    uint32_t fetchable;  /* camera address of fetchable flags array */
 } ptpbuf_t;
 
 
@@ -205,12 +199,14 @@ ptpcam_siginthandler(int signum)
 	}
 
 	PTP_USB* ptp_usb=(PTP_USB *)globalparams->data;
-	struct usb_device *dev=usb_device(ptp_usb->handle);
 
 	/* hey it's not that easy though... but at least we can try! */
 	printf("Got SIGINT, trying to clean up and close...\n");
 	usleep(5000);
-	close_camera (ptp_usb, globalparams, dev);
+	ptp_closesession(globalparams);
+	libusb_release_interface(ptp_usb->handle, ptp_usb->interface);
+	libusb_reset_device(ptp_usb->handle);
+	libusb_close(ptp_usb->handle);
 	exit (-1);
     }
 }
@@ -221,21 +217,29 @@ ptp_read_func (unsigned char *bytes, unsigned int size, void *data)
 	int result=-1;
 	PTP_USB *ptp_usb=(PTP_USB *)data;
 	int toread=0;
+	int actual=0;
 	signed long int rbytes=size;
 
 	do {
-		bytes+=toread;
+
 		if (rbytes>PTPCAM_USB_URB) 
 			toread = PTPCAM_USB_URB;
 		else
 			toread = rbytes;
-		result=USB_BULK_READ(ptp_usb->handle, ptp_usb->inep,(char *)bytes, toread,ptpcam_usb_timeout);
+		result=libusb_bulk_transfer(ptp_usb->handle, ptp_usb->inep,
+		                            bytes, toread, &actual,
+		                            ptpcam_usb_timeout);
 		/* sometimes retry might help */
-		if (result==0)
-			result=USB_BULK_READ(ptp_usb->handle, ptp_usb->inep,(char *)bytes, toread,ptpcam_usb_timeout);
+		if (result==LIBUSB_ERROR_TIMEOUT)
+			result=libusb_bulk_transfer(ptp_usb->handle, ptp_usb->inep,
+			                            bytes, toread, &actual,
+			                            ptpcam_usb_timeout);
 		if (result < 0)
 			break;
-		rbytes-=PTPCAM_USB_URB;
+		bytes += actual;
+		rbytes -= actual;
+		if (actual < toread)
+			break; // Short packet indicates end of transfer
 	} while (rbytes>0);
 
 	if (result >= 0) {
@@ -243,23 +247,26 @@ ptp_read_func (unsigned char *bytes, unsigned int size, void *data)
 	}
 	else 
 	{
-		if (verbose) perror("usb_bulk_read");
+		if (verbose) fprintf(stderr, "libusb_bulk_transfer (read) error %d\n", result);
 		return PTP_ERROR_IO;
 	}
 }
+
 
 static short
 ptp_write_func (unsigned char *bytes, unsigned int size, void *data)
 {
 	int result;
+	int actual;
 	PTP_USB *ptp_usb=(PTP_USB *)data;
 
-	result=USB_BULK_WRITE(ptp_usb->handle,ptp_usb->outep,(char *)bytes,size,ptpcam_usb_timeout);
-	if (result >= 0)
+	result=libusb_bulk_transfer(ptp_usb->handle, ptp_usb->outep,
+	                            bytes, size, &actual, ptpcam_usb_timeout);
+	if (result == 0)
 		return (PTP_RC_OK);
 	else 
 	{
-		if (verbose) perror("usb_bulk_write");
+		if (verbose) fprintf(stderr, "libusb_bulk_transfer (write) error %d\n", result);
 		return PTP_ERROR_IO;
 	}
 }
@@ -269,17 +276,20 @@ static short
 ptp_check_int (unsigned char *bytes, unsigned int size, void *data)
 {
 	int result;
+	int actual=0;
 	PTP_USB *ptp_usb=(PTP_USB *)data;
 
-	result=USB_BULK_READ(ptp_usb->handle, ptp_usb->intep,(char *)bytes,size,ptpcam_usb_timeout);
-	if (result==0)
-	    result=USB_BULK_READ(ptp_usb->handle, ptp_usb->intep,(char *)bytes,size,ptpcam_usb_timeout);
-	if (verbose>2) fprintf (stderr, "USB_BULK_READ returned %i, size=%i\n", result, size);
+	result=libusb_bulk_transfer(ptp_usb->handle, ptp_usb->intep,
+	                            bytes, size, &actual, ptpcam_usb_timeout);
+	if (result==LIBUSB_ERROR_TIMEOUT)
+	    result=libusb_bulk_transfer(ptp_usb->handle, ptp_usb->intep,
+	                                bytes, size, &actual, ptpcam_usb_timeout);
+	if (verbose>2) fprintf (stderr, "libusb_bulk_transfer (int) returned %i, actual=%i, size=%i\n", result, actual, size);
 
-	if (result >= 0) {
-		return result;
+	if (result == 0) {
+		return actual;
 	} else {
-		if (verbose) perror("ptp_check_int");
+		if (verbose) fprintf(stderr, "ptp_check_int error %d\n", result);
 		return result;
 	}
 }
@@ -310,9 +320,10 @@ ptpcam_error (void *data, const char *format, va_list args)
 
 
 void
-init_ptp_usb (PTPParams* params, PTP_USB* ptp_usb, struct usb_device* dev)
+init_ptp_usb (PTPParams* params, PTP_USB* ptp_usb, libusb_device* dev)
 {
-	usb_dev_handle *device_handle;
+	libusb_device_handle *device_handle;
+	struct libusb_config_descriptor *config;
 
 	params->write_func=ptp_write_func;
 	params->read_func=ptp_read_func;
@@ -328,15 +339,25 @@ init_ptp_usb (PTPParams* params, PTP_USB* ptp_usb, struct usb_device* dev)
 	params->transaction_id=0;
 	params->byteorder = PTP_DL_LE;
 
-	if ((device_handle=usb_open(dev))){
-		if (!device_handle) {
-			perror("usb_open()");
-			exit(0);
+	if (libusb_open(dev, &device_handle) != 0) {
+		perror("libusb_open()");
+		exit(0);
+	}
+	ptp_usb->handle = device_handle;
+	int r = libusb_get_active_config_descriptor(dev, &config);
+	if (r != 0) {
+		r = libusb_get_config_descriptor(dev, 0, &config);
+		if (r == 0) {
+			libusb_set_configuration(device_handle, config->bConfigurationValue);
 		}
-		ptp_usb->handle=device_handle;
-		usb_set_configuration(device_handle, dev->config->bConfigurationValue);
-		usb_claim_interface(device_handle,
-			dev->config->interface->altsetting->bInterfaceNumber);
+	}
+	if (r == 0) {
+		ptp_usb->interface = config->interface[0].altsetting[0].bInterfaceNumber;
+		libusb_free_config_descriptor(config);
+	}
+	libusb_detach_kernel_driver(device_handle, ptp_usb->interface);
+	if (libusb_claim_interface(device_handle, ptp_usb->interface) != 0) {
+		fprintf(stderr, "ERROR: Could not claim interface %d\n", ptp_usb->interface);
 	}
 	globalparams=params;
 }
@@ -374,105 +395,119 @@ clear_stall(PTP_USB* ptp_usb)
 }
 
 void
-close_usb(PTP_USB* ptp_usb, struct usb_device* dev)
+close_usb(PTP_USB* ptp_usb)
 {
 	//clear_stall(ptp_usb);
-        usb_release_interface(ptp_usb->handle,
-                dev->config->interface->altsetting->bInterfaceNumber);
-	usb_reset(ptp_usb->handle);
-        usb_close(ptp_usb->handle);
+	libusb_release_interface(ptp_usb->handle, ptp_usb->interface);
+	libusb_reset_device(ptp_usb->handle);
+	libusb_close(ptp_usb->handle);
 }
 
 
-struct usb_bus*
-init_usb()
+void
+init_usb(void)
 {
-	usb_init();
-	usb_find_busses();
-	usb_find_devices();
-	return (usb_get_busses());
+	libusb_init(&ctx);
 }
 
 /*
-   find_device() returns the pointer to a usb_device structure matching
+   find_device() returns the pointer to a libusb_device matching
    given busn, devicen numbers. If any or both of arguments are 0 then the
    first matching PTP device structure is returned. 
 */
-struct usb_device*
+libusb_device*
 find_device (int busn, int devicen, short force);
-struct usb_device*
+libusb_device*
 find_device (int busn, int devn, short force)
 {
-	struct usb_bus *bus;
-	struct usb_device *dev;
+	libusb_device **list;
+	libusb_device *found = NULL;
+	ssize_t cnt, i;
 
-	bus=init_usb();
-	for (; bus; bus = bus->next)
-	for (dev = bus->devices; dev; dev = dev->next)
-	if (dev->config)
-	if ((dev->config->interface->altsetting->bInterfaceClass==
-		USB_CLASS_PTP)||force)
-	if (dev->descriptor.bDeviceClass!=USB_CLASS_HUB)
-	{
-		int curbusn, curdevn;
+	init_usb();
+	cnt = libusb_get_device_list(ctx, &list);
+	if (cnt < 0) return NULL;
 
-		curbusn=strtol(bus->dirname,NULL,10);
-#ifdef WIN32
-		curdevn=strtol(strchr(dev->filename,'-')+1,NULL,10);
-#else    
-		curdevn=strtol(dev->filename,NULL,10);
-#endif
+	for (i = 0; i < cnt; i++) {
+		libusb_device *dev = list[i];
+		struct libusb_device_descriptor desc;
+		struct libusb_config_descriptor *config;
 
-		if (devn==0) {
-			if (busn==0) return dev;
-			if (curbusn==busn) return dev;
-		} else {
-			if ((busn==0)&&(curdevn==devn)) return dev;
-			if ((curbusn==busn)&&(curdevn==devn)) return dev;
+		if (libusb_get_device_descriptor(dev, &desc) != 0) continue;
+		if (desc.bDeviceClass == LIBUSB_CLASS_HUB) continue;
+		if (libusb_get_config_descriptor(dev, 0, &config) != 0) continue;
+
+		if ((config->interface[0].altsetting[0].bInterfaceClass ==
+				LIBUSB_CLASS_IMAGE) || force) {
+			int curbusn = libusb_get_bus_number(dev);
+			int curdevn = libusb_get_device_address(dev);
+
+			if (devn == 0) {
+				if (busn == 0 || curbusn == busn) {
+					found = dev;
+					libusb_free_config_descriptor(config);
+					break;
+				}
+			} else {
+				if ((busn == 0 && curdevn == devn) ||
+				    (curbusn == busn && curdevn == devn)) {
+					found = dev;
+					libusb_free_config_descriptor(config);
+					break;
+				}
+			}
 		}
+		libusb_free_config_descriptor(config);
 	}
-	return NULL;
+
+	if (found)
+		libusb_ref_device(found);
+	libusb_free_device_list(list, 1);
+	return found;
 }
 
 void
-find_endpoints(struct usb_device *dev, int* inep, int* outep, int* intep);
+find_endpoints(libusb_device *dev, int* inep, int* outep, int* intep);
 void
-find_endpoints(struct usb_device *dev, int* inep, int* outep, int* intep)
+find_endpoints(libusb_device *dev, int* inep, int* outep, int* intep)
 {
-	int i,n;
-	struct usb_endpoint_descriptor *ep;
+	int i;
+	struct libusb_config_descriptor *config;
 
-	ep = dev->config->interface->altsetting->endpoint;
-	n=dev->config->interface->altsetting->bNumEndpoints;
+	if (libusb_get_config_descriptor(dev, 0, &config) != 0) return;
 
-	for (i=0;i<n;i++) {
-	if (ep[i].bmAttributes==USB_ENDPOINT_TYPE_BULK)	{
-		if ((ep[i].bEndpointAddress&USB_ENDPOINT_DIR_MASK)==
-			USB_ENDPOINT_DIR_MASK)
-		{
-			*inep=ep[i].bEndpointAddress;
+	const struct libusb_interface_descriptor *altsetting =
+		&config->interface[0].altsetting[0];
+	int n = altsetting->bNumEndpoints;
+	const struct libusb_endpoint_descriptor *ep = altsetting->endpoint;
+
+	for (i = 0; i < n; i++) {
+		if ((ep[i].bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) ==
+				LIBUSB_TRANSFER_TYPE_BULK) {
+			if ((ep[i].bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) ==
+					LIBUSB_ENDPOINT_IN) {
+				*inep = ep[i].bEndpointAddress;
+				if (verbose>1)
+					fprintf(stderr, "Found inep: 0x%02x\n", *inep);
+			} else {
+				*outep = ep[i].bEndpointAddress;
+				if (verbose>1)
+					fprintf(stderr, "Found outep: 0x%02x\n", *outep);
+			}
+		} else if (((ep[i].bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) ==
+					LIBUSB_TRANSFER_TYPE_INTERRUPT) &&
+				((ep[i].bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) ==
+					LIBUSB_ENDPOINT_IN)) {
+			*intep = ep[i].bEndpointAddress;
 			if (verbose>1)
-				fprintf(stderr, "Found inep: 0x%02x\n",*inep);
-		}
-		if ((ep[i].bEndpointAddress&USB_ENDPOINT_DIR_MASK)==0)
-		{
-			*outep=ep[i].bEndpointAddress;
-			if (verbose>1)
-				fprintf(stderr, "Found outep: 0x%02x\n",*outep);
-		}
-		} else if ((ep[i].bmAttributes==USB_ENDPOINT_TYPE_INTERRUPT) &&
-			((ep[i].bEndpointAddress&USB_ENDPOINT_DIR_MASK)==
-				USB_ENDPOINT_DIR_MASK))
-		{
-			*intep=ep[i].bEndpointAddress;
-			if (verbose>1)
-				fprintf(stderr, "Found intep: 0x%02x\n",*intep);
+				fprintf(stderr, "Found intep: 0x%02x\n", *intep);
 		}
 	}
+	libusb_free_config_descriptor(config);
 }
 
 int
-open_camera (int busn, int devn, short force, PTP_USB *ptp_usb, PTPParams *params, struct usb_device **dev)
+open_camera (int busn, int devn, short force, PTP_USB *ptp_usb, PTPParams *params, libusb_device **dev)
 {
 	int retrycnt=0;
 	uint16_t ret=0;
@@ -505,50 +540,61 @@ open_camera (int busn, int devn, short force, PTP_USB *ptp_usb, PTPParams *param
 	retrycnt=0;
 	while ((retrycnt++ < MAXCONNRETRIES) && ((ret=ptp_opensession(params,1))!=PTP_RC_OK)) {
 		printf("Failed to connect (attempt %d), retrying in 1 s...\n", retrycnt);
-		close_usb(ptp_usb, *dev);
+		close_usb(ptp_usb);
 		sleep(1);
 		find_endpoints(*dev,&ptp_usb->inep,&ptp_usb->outep,&ptp_usb->intep);
 		init_ptp_usb(params, ptp_usb, *dev);   
 	}  
 	if (ret != PTP_RC_OK) {
 		fprintf(stderr,"ERROR: Could not open session!\n");
-		close_usb(ptp_usb, *dev);
+		close_usb(ptp_usb);
 		return -1;
 	}
 
 	if (ptp_getdeviceinfo(params,&params->deviceinfo)!=PTP_RC_OK) {
 		fprintf(stderr,"ERROR: Could not get device info!\n");
-		close_usb(ptp_usb, *dev);
+		close_usb(ptp_usb);
 		return -1;
 	}
 	return 0;
 }
 
 void
-close_camera (PTP_USB *ptp_usb, PTPParams *params, struct usb_device *dev)
+close_camera (PTP_USB *ptp_usb, PTPParams *params, libusb_device *dev)
 {
 	if (ptp_closesession(params)!=PTP_RC_OK)
 		fprintf(stderr,"ERROR: Could not close session!\n");
-	close_usb(ptp_usb, dev);
+	close_usb(ptp_usb);
+	if (dev) libusb_unref_device(dev);
 }
 
 
 void
 list_devices(short force)
 {
-	struct usb_bus *bus;
-	struct usb_device *dev;
+	libusb_device **list;
+	ssize_t cnt, i;
 	int found=0;
 
+	init_usb();
+	cnt = libusb_get_device_list(ctx, &list);
+	if (cnt < 0) {
+		fprintf(stderr, "Could not get USB device list\n");
+		return;
+	}
 
-	bus=init_usb();
-  	for (; bus; bus = bus->next)
-    	for (dev = bus->devices; dev; dev = dev->next) {
+	for (i = 0; i < cnt; i++) {
+		libusb_device *dev = list[i];
+		struct libusb_device_descriptor desc;
+		struct libusb_config_descriptor *config;
+
+		if (libusb_get_device_descriptor(dev, &desc) != 0) continue;
+		if (desc.bDeviceClass == LIBUSB_CLASS_HUB) continue;
+		if (libusb_get_config_descriptor(dev, 0, &config) != 0) continue;
+
 		/* if it's a PTP device try to talk to it */
-		if (dev->config)
-		if ((dev->config->interface->altsetting->bInterfaceClass==
-			USB_CLASS_PTP)||force)
-		if (dev->descriptor.bDeviceClass!=USB_CLASS_HUB)
+		if ((config->interface[0].altsetting[0].bInterfaceClass ==
+				LIBUSB_CLASS_IMAGE) || force)
 		{
 			PTPParams params;
 			PTP_USB ptp_usb;
@@ -560,7 +606,7 @@ list_devices(short force)
 				found=1;
 			}
 
-			find_endpoints(dev,&ptp_usb.inep,&ptp_usb.outep,
+			find_endpoints(dev, &ptp_usb.inep, &ptp_usb.outep,
 				&ptp_usb.intep);
 			init_ptp_usb(&params, &ptp_usb, dev);
 
@@ -570,26 +616,30 @@ list_devices(short force)
 			CC(ptp_getdeviceinfo (&params, &deviceinfo),
 				"Could not get device info!\n");
 
-      			printf("%s/%s\t0x%04X/0x%04X\t%s\n",
-				bus->dirname, dev->filename,
-				dev->descriptor.idVendor,
-				dev->descriptor.idProduct, deviceinfo.Model);
+      			printf("%03d/%03d\t0x%04X/0x%04X\t%s\n",
+				libusb_get_bus_number(dev),
+				libusb_get_device_address(dev),
+				desc.idVendor,
+				desc.idProduct, deviceinfo.Model);
 
 			CC(ptp_closesession(&params),
 				"Could not close session!\n");
-			close_usb(&ptp_usb, dev);
+			close_usb(&ptp_usb);
 		}
+		libusb_free_config_descriptor(config);
 	}
+	libusb_free_device_list(list, 1);
 	if (!found) printf("\nFound no PTP devices\n");
 	printf("\n");
 }
+
 
 void
 show_info (int busn, int devn, short force)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 
 	printf("\nCamera information\n");
 	printf("==================\n");
@@ -616,7 +666,7 @@ capture_image (int busn, int devn, short force)
 	PTP_USB ptp_usb;
 	PTPContainer event;
 	int ExposureTime=0;
-	struct usb_device *dev;
+	libusb_device *dev;
 	short ret;
 
 	printf("\nInitiating captue...\n");
@@ -676,7 +726,7 @@ loop_capture (int busn, int devn, short force, int n,  int overwrite)
 	PTPParams params;
 	PTP_USB ptp_usb;
 	PTPContainer event;
-	struct usb_device *dev;
+	libusb_device *dev;
 	int file;
 	PTPObjectInfo oi;
 	uint32_t handle=0;
@@ -789,7 +839,7 @@ nikon_initiate_dc (int busn, int devn, short force)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 	uint16_t result;
     
 	if (open_camera(busn, devn, force, &ptp_usb, &params, &dev)<0)
@@ -830,7 +880,7 @@ nikon_direct_capture (int busn, int devn, short force, char* filename,int overwr
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 	uint16_t result;
 	uint16_t nevent=0;
 	PTPUSBEventContainer* events=NULL;
@@ -962,7 +1012,7 @@ nikon_direct_capture2 (int busn, int devn, short force, char* filename, int over
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 	uint16_t result;
 	PTPObjectInfo oi;
 
@@ -978,7 +1028,7 @@ nikon_direct_capture2 (int busn, int devn, short force, char* filename, int over
 
 	if (ptp_opensession(&params,1)!=PTP_RC_OK) {
 		fprintf(stderr,"ERROR: Could not open session!\n");
-		close_usb(&ptp_usb, dev);
+		close_usb(&ptp_usb);
 		return ;
 	}
 /*
@@ -1009,7 +1059,7 @@ nikon_direct_capture2 (int busn, int devn, short force, char* filename, int over
 
 	if (ptp_opensession(&params,1)!=PTP_RC_OK) {
     		fprintf(stderr,"ERROR: Could not open session!\n");
-    		close_usb(&ptp_usb, dev);
+    		close_usb(&ptp_usb);
     		return;
     	}
 loop:
@@ -1028,7 +1078,7 @@ loop:
 #if 0
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 	uint16_t result;
 	uint16_t nevent=0;
 	PTPUSBEventContainer* events=NULL;
@@ -1131,8 +1181,8 @@ list_files (int busn, int devn, short force)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
-	int i;
+	libusb_device *dev;
+	uint32_t i;
 	PTPObjectInfo oi;
 	struct tm *tm;
 
@@ -1165,7 +1215,7 @@ delete_object (int busn, int devn, short force, uint32_t handle)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 	PTPObjectInfo oi;
 
 	if (open_camera(busn, devn, force, &ptp_usb, &params, &dev)<0)
@@ -1182,10 +1232,10 @@ delete_all_files (int busn, int devn, short force)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 	PTPObjectInfo oi;
 	uint32_t handle;
-	int i;
+	uint32_t i;
 	int ret;
 
 	if (open_camera(busn, devn, force, &ptp_usb, &params, &dev)<0)
@@ -1301,7 +1351,7 @@ int overwrite)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 
 	if (open_camera(busn, devn, force, &ptp_usb, &params, &dev)<0)
 		return;
@@ -1318,8 +1368,8 @@ get_all_files (int busn, int devn, short force, int overwrite)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
-	int i;
+	libusb_device *dev;
+	uint32_t i;
 
 	if (open_camera(busn, devn, force, &ptp_usb, &params, &dev)<0)
 		return;
@@ -1344,8 +1394,8 @@ list_operations (int busn, int devn, short force)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
-	int i;
+	libusb_device *dev;
+	uint32_t i;
 	const char* name;
 
 	printf("\nListing supported operations...\n");
@@ -1381,9 +1431,9 @@ list_properties (int busn, int devn, short force)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 	const char* propname;
-	int i;
+	uint32_t i;
 
 	printf("\nListing properties...\n");
 
@@ -1631,7 +1681,7 @@ getset_propertybyname (int busn,int devn,char* property,char* value,short force)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 	char *p;
 	uint16_t dpc;
 	const char *propval=NULL;
@@ -1697,7 +1747,7 @@ getset_property (int busn,int devn,uint16_t property,char* value,short force)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 
 	printf ("\n");
 
@@ -1835,11 +1885,11 @@ show_all_properties (int busn,int devn,short force, int unknown)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 	PTPDevicePropDesc dpd;
 	const char* propname;
 	const char *propdesc;
-	int i;
+	uint32_t i;
 
 	printf ("\n");
 
@@ -1885,17 +1935,17 @@ show_all_properties (int busn,int devn,short force, int unknown)
 int
 usb_get_endpoint_status(PTP_USB* ptp_usb, int ep, uint16_t* status)
 {
-	 return (usb_control_msg(ptp_usb->handle,
-		USB_DP_DTH|USB_RECIP_ENDPOINT, USB_REQ_GET_STATUS,
-		USB_FEATURE_HALT, ep, (char *)status, 2, 3000));
+	 return (libusb_control_transfer(ptp_usb->handle,
+		LIBUSB_ENDPOINT_IN|LIBUSB_RECIPIENT_ENDPOINT, LIBUSB_REQUEST_GET_STATUS,
+		USB_FEATURE_HALT, ep, (unsigned char *)status, 2, 3000));
 }
 
 int
 usb_clear_stall_feature(PTP_USB* ptp_usb, int ep)
 {
 
-	return (usb_control_msg(ptp_usb->handle,
-		USB_RECIP_ENDPOINT, USB_REQ_CLEAR_FEATURE, USB_FEATURE_HALT,
+	return (libusb_control_transfer(ptp_usb->handle,
+		LIBUSB_RECIPIENT_ENDPOINT, LIBUSB_REQUEST_CLEAR_FEATURE, USB_FEATURE_HALT,
 		ep, NULL, 0, 3000));
 }
 
@@ -1904,10 +1954,10 @@ usb_ptp_get_device_status(PTP_USB* ptp_usb, uint16_t* devstatus);
 int
 usb_ptp_get_device_status(PTP_USB* ptp_usb, uint16_t* devstatus)
 {
-	return (usb_control_msg(ptp_usb->handle,
-		USB_DP_DTH|USB_TYPE_CLASS|USB_RECIP_INTERFACE,
+	return (libusb_control_transfer(ptp_usb->handle,
+		LIBUSB_ENDPOINT_IN|LIBUSB_REQUEST_TYPE_CLASS|LIBUSB_RECIPIENT_INTERFACE,
 		USB_REQ_GET_DEVICE_STATUS, 0, 0,
-		(char *)devstatus, 4, 3000));
+		(unsigned char *)devstatus, 4, 3000));
 }
 
 int
@@ -1915,8 +1965,8 @@ usb_ptp_device_reset(PTP_USB* ptp_usb);
 int
 usb_ptp_device_reset(PTP_USB* ptp_usb)
 {
-	return (usb_control_msg(ptp_usb->handle,
-		USB_TYPE_CLASS|USB_RECIP_INTERFACE,
+	return (libusb_control_transfer(ptp_usb->handle,
+		LIBUSB_REQUEST_TYPE_CLASS|LIBUSB_RECIPIENT_INTERFACE,
 		USB_REQ_DEVICE_RESET, 0, 0, NULL, 0, 3000));
 }
 
@@ -1927,7 +1977,7 @@ reset_device (int busn, int devn, short force)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	libusb_device *dev;
 	uint16_t status;
 	uint16_t devstatus[2] = {0,0};
 	int ret;
@@ -1995,9 +2045,10 @@ reset_device (int busn, int devn, short force)
 	/* get device status (devices likes that regardless of its result)*/
 	usb_ptp_get_device_status(&ptp_usb,devstatus);
 
-	close_usb(&ptp_usb, dev);
+	close_usb(&ptp_usb);
 
 }
+
 
 /* main program  */
 
@@ -2256,7 +2307,7 @@ static int camera_dev = 0;
 static int camera_force = 0;
 static PTP_USB ptp_usb;
 static PTPParams params;
-static struct usb_device *dev;
+static libusb_device *dev;
 static int connected = 0;
 
 static void open_connection()
@@ -2313,7 +2364,7 @@ static void print_safe(char *buf, int size)
   }
 }
 
-static void hexdump(char *buf, unsigned int size, unsigned int offset)
+static void hexdump(unsigned char *buf, unsigned int size, unsigned int offset)
 {
   unsigned int start_offset = offset;
   unsigned int i;
@@ -2377,7 +2428,7 @@ static void hexdump(char *buf, unsigned int size, unsigned int offset)
   printf("\n");
 }
 
-static void hexdump4(char *buf, unsigned int size, unsigned int offset)
+static void hexdump4(unsigned char *buf, unsigned int size, unsigned int offset)
 {
   unsigned int i;
   char s[16];
@@ -2425,7 +2476,7 @@ static void hexdump4(char *buf, unsigned int size, unsigned int offset)
   printf("\n");
 }
 
-int engio_dump(unsigned char * data_buf, int length, int addr)
+void engio_dump(unsigned char * data_buf, unsigned int length, int addr)
 {
     unsigned int reg = 0;
     unsigned int data = 0;
@@ -2446,7 +2497,7 @@ int engio_dump(unsigned char * data_buf, int length, int addr)
     printf("\r\n");
 }
 
-int adtg_dump(unsigned char * data_buf, int length, int addr)
+void adtg_dump(unsigned char * data_buf, unsigned int length, int addr)
 {
     unsigned int reg = 0;
     unsigned int data = 0;
@@ -2467,11 +2518,13 @@ int adtg_dump(unsigned char * data_buf, int length, int addr)
     printf("\r\n");
 }
 
+#ifndef WIN32
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+#endif
 #define INVALID_SOCKET -1
 int gdb_port = 23946;
 
@@ -2495,7 +2548,7 @@ int accepttimeout ( int s, struct sockaddr *addr, int *addrlen, int timeout )
     if (n == -1) return -1; // error
 
     // data must be here, so do a normal recv()
-    return accept ( s, addr, addrlen );
+    return accept ( s, addr, (socklen_t *)addrlen );
 }
 
 
@@ -2578,10 +2631,7 @@ unsigned int gdb_listen ( )
     int server_fd = INVALID_SOCKET;
     int client_fd = INVALID_SOCKET;
 
-#ifdef WIN32
-    if ( WSAStartup ( 0x101, &gdb_wsadata ) != 0 )
-        return E_FAIL;
-#endif
+
 
 	local.sin_family = AF_INET; 
 	local.sin_addr.s_addr = INADDR_ANY; 
@@ -2796,11 +2846,11 @@ int chdk(int busn, int devn, short force)
       } else {
         if(width == 4)
         {
-            hexdump4(buf2,end-start,start);
+            hexdump4((unsigned char *)buf2,end-start,start);
         }
         else
         {
-            hexdump(buf2,end-start,start);
+            hexdump((unsigned char *)buf2,end-start,start);
         }
         free(buf2);
       }
@@ -2867,22 +2917,22 @@ int chdk(int busn, int devn, short force)
         unsigned char *data_buf;
         FILE *dumpfile;
 
-        buf2 = strchr(buf,' ')+1;
+        buf2 = (unsigned char *)strchr(buf,' ')+1;
 
-        if ( (s = strchr(buf2,'-')) != NULL )
+        if ( (s = (unsigned char *)strchr((char *)buf2,'-')) != NULL )
         {
             *s = '\0';
-            start = strtoul(buf2,NULL,0);
-            end = strtoul(s+1,NULL,0)+1;
+            start = strtoul((char *)buf2,NULL,0);
+            end = strtoul((char *)s+1,NULL,0)+1;
         }
-        else if ( (s = strchr(buf2,' ')) != NULL )
+        else if ( (s = (unsigned char *)strchr((char *)buf2,' ')) != NULL )
         {
             *s = '\0';
-            start = strtoul(buf2,NULL,0);
-            end = start+strtoul(s+1,NULL,0);
+            start = strtoul((char *)buf2,NULL,0);
+            end = start+strtoul((char *)s+1,NULL,0);
         }
         else {
-            start = strtoul(buf2,NULL,0);
+            start = strtoul((char *)buf2,NULL,0);
             end = start + 0x100;
         }
         
@@ -3006,8 +3056,8 @@ int chdk(int busn, int devn, short force)
         unsigned char *buf2;
         ptpbuf_t *ptpbuf;
 
-        buf2 = strchr(buf,' ')+1;
-        start = strtoul(buf2,NULL,0);
+        buf2 = (unsigned char *)strchr(buf,' ')+1;
+        start = strtoul((char *)buf2,NULL,0);
 
         /* get reference buffer */
         if((ptpbuf = ptp_chdk_get_memory(start,sizeof(ptpbuf_t),&params,&params.deviceinfo)) == NULL )
@@ -3052,13 +3102,13 @@ int chdk(int busn, int devn, short force)
                 }
                 else
                 {
-                    int num = 0;
+                    uint32_t num = 0;
                     for(num = 0; num < ptpbuf->buffer_count; num++)
                     {
                         if(fetchable[num])
                         {
                             ptpbuf_buffer_t *buffer;
-                            uint32_t buffer_address = (uint32_t)ptpbuf->buffers + (num * (ptpbuf->buffer_size + 4));
+                            uint32_t buffer_address = ptpbuf->buffers + (num * (ptpbuf->buffer_size + 4));
                             
                             idle = 0;
                             //printf("PTPbuf: buffer 0x%02X at 0x%08X is full. fetching...\r\n", num, buffer_address);
@@ -3071,21 +3121,21 @@ int chdk(int busn, int devn, short force)
                             else
                             {
                                 /* set buffer free */
-                                if (!ptp_chdk_set_memory_long((uint32_t)ptpbuf->fetchable + num * 4, 0,&params,&params.deviceinfo) )
+                                if (!ptp_chdk_set_memory_long(ptpbuf->fetchable + num * 4, 0,&params,&params.deviceinfo) )
                                 {
                                     printf("error writing memory\n");
                                     error = 1;
                                 }
                                 else
                                 {
-                                    int pos = 0;
+                                    uint32_t pos = 0;
                                     
                                     //printf("PTPbuf: 0x%02X bytes used\r\n", buffer->bytes_used);
                                     
                                     while(pos < buffer->bytes_used)
                                     {
-                                        ptpbuf_packet_t *packet = &(buffer->data) + pos;
-                                        uint8_t *payload = &(buffer->data) + pos + sizeof(ptpbuf_packet_t);
+                                        ptpbuf_packet_t *packet = (ptpbuf_packet_t *)((uint8_t *)(&buffer->data) + pos);
+                                        uint8_t *payload = (uint8_t *)(&buffer->data) + pos + sizeof(ptpbuf_packet_t);
                                         uint32_t packet_length = sizeof(ptpbuf_packet_t) + packet->length;
                                         
                                         if(packet->length <= ptpbuf->buffer_size - pos - sizeof(ptpbuf_packet_t))
@@ -3144,23 +3194,23 @@ int chdk(int busn, int devn, short force)
       {
           width = 4;
       }
-      buf2 = strchr(buf,' ')+1;
+      buf2 = (unsigned char *)strchr(buf,' ')+1;
 
-      if ( (s = strchr(buf2,'-')) != NULL )
+      if ( (s = strchr((char *)buf2,'-')) != NULL )
       {
         *s = '\0';
-        start = strtoul(buf2,NULL,0);
+        start = strtoul((char *)buf2,NULL,0);
         end = strtoul(s+1,NULL,0)+1;
       } 
-      else if ( (s = strchr(buf2,' ')) != NULL )
+      else if ( (s = strchr((char *)buf2,' ')) != NULL )
       {
         *s = '\0';
-        start = strtoul(buf2,NULL,0);
+        start = strtoul((char *)buf2,NULL,0);
         end = start+strtoul(s+1,NULL,0);
       } 
       else
       {
-        start = strtoul(buf2,NULL,0);
+        start = strtoul((char *)buf2,NULL,0);
         end = start+0x100;
       }
      
@@ -3299,13 +3349,8 @@ int chdk(int busn, int devn, short force)
     } 
     else if ( !strncmp("rate ",buf,5))
     {
-        int regdump = 0;
         int start;
-        int deltaPos;
-        int deltaNum = 0;
-        char *s;
         unsigned char *buf2;
-        unsigned int *deltaCount;
         unsigned int oldVal = 0;
         unsigned int maxVal = 0;
         struct timeval oldTv;
@@ -3313,9 +3358,9 @@ int chdk(int busn, int devn, short force)
         unsigned int loops = 0;
         double avgDelta = -1.0f;
 
-        buf2 = strchr(buf,' ') + 1;
+        buf2 = (unsigned char *)strchr(buf,' ') + 1;
       
-        start = strtoul(buf2,NULL,0);
+        start = strtoul((char *)buf2,NULL,0);
         
         while(!kbhit())
         {
@@ -3452,7 +3497,7 @@ int chdk(int busn, int devn, short force)
         {
           printf("%3i: %i\n",i,vals[i-start]);
         }
-        hexdump((char *) vals,(end-start)*4,start*4);
+        hexdump((unsigned char *) vals,(end-start)*4,start*4);
         free(vals);
       }
       
@@ -3504,7 +3549,7 @@ int chdk(int busn, int devn, short force)
           printf(")\n");
           p += t;
         }
-        hexdump(buf2,p-buf2,0);
+        hexdump((unsigned char *)buf2,p-buf2,0);
         free(buf2);
       }
 

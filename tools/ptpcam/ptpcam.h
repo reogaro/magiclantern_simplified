@@ -19,55 +19,43 @@
 #ifndef __PTPCAM_H__
 #define __PTPCAM_H__
 
-#ifdef LINUX_OS
-#define USB_BULK_READ myusb_bulk_read
-#define USB_BULK_WRITE myusb_bulk_write
-int myusb_bulk_read(usb_dev_handle *dev, int ep, char *bytes, int size,
-	int timeout);
-int myusb_bulk_write(usb_dev_handle *dev, int ep, char *bytes, int length,
-	int timeout);
-#else
-#define USB_BULK_READ usb_bulk_read
-#define USB_BULK_WRITE usb_bulk_write
-#endif
-
 /*
  * macros
  */
 
 /* Check value and Return on error */
-#define CR(o,error) {						\
-			uint16_t result=o;				\
-			if((result)!=PTP_RC_OK) {			\
-				ptp_perror(&params,result);		\
-				fprintf(stderr,"ERROR: "error);		\
+#define CR(o,error) {					\
+			uint16_t result=o;			\
+			if((result)!=PTP_RC_OK) {		\
+				ptp_perror(&params,result);	\
+				fprintf(stderr,"ERROR: "error);	\
 				close_camera(&ptp_usb, &params, dev);   \
-				return;					\
-			}						\
+				return;				\
+			}					\
 }
 
 /* Check value and Continue on error */
-#define CC(result,error) {						\
-			if((result)!=PTP_RC_OK) {			\
-				fprintf(stderr,"ERROR: "error);		\
-				usb_release_interface(ptp_usb.handle,	\
-		dev->config->interface->altsetting->bInterfaceNumber);	\
-				continue;					\
-			}						\
+#define CC(result,error) {					\
+			if((result)!=PTP_RC_OK) {		\
+				fprintf(stderr,"ERROR: "error);	\
+				libusb_release_interface(ptp_usb.handle,\
+			ptp_usb.interface);			\
+				continue;			\
+			}					\
 }
 
 /* error reporting macro */
 #ifndef ERROR
-#define ERROR(error) fprintf(stderr,"ERROR: "error);				
+#define ERROR(error) fprintf(stderr,"ERROR: "error);			
 #endif
 
 /* property value printing macros */
 #define PRINT_PROPVAL_DEC(value)	\
-		print_propval(dpd.DataType, value,			\
+		print_propval(dpd.DataType, value,		\
 		PTPCAM_PRINT_DEC)
 
-#define PRINT_PROPVAL_HEX(value)					\
-		print_propval(dpd.DataType, value,			\
+#define PRINT_PROPVAL_HEX(value)				\
+		print_propval(dpd.DataType, value,		\
 		PTPCAM_PRINT_HEX)
 
 
@@ -116,7 +104,8 @@ int myusb_bulk_write(usb_dev_handle *dev, int ep, char *bytes, int length,
 
 typedef struct _PTP_USB PTP_USB;
 struct _PTP_USB {
-	usb_dev_handle* handle;
+	libusb_device_handle *handle;
+	int interface;
 	int inep;
 	int outep;
 	int intep;
@@ -156,14 +145,14 @@ void save_object(PTPParams *params, uint32_t handle, char* filename, PTPObjectIn
 void get_save_object (PTPParams *params, uint32_t handle, char* filename, int overwrite);
 
 
-struct usb_bus* init_usb(void);
-void close_usb(PTP_USB* ptp_usb, struct usb_device* dev);
-void init_ptp_usb (PTPParams*, PTP_USB*, struct usb_device*);
+void init_usb(void);
+void close_usb(PTP_USB* ptp_usb);
+void init_ptp_usb (PTPParams*, PTP_USB*, libusb_device*);
 void clear_stall(PTP_USB* ptp_usb);
 
 int usb_get_endpoint_status(PTP_USB* ptp_usb, int ep, uint16_t* status);
 int usb_clear_stall_feature(PTP_USB* ptp_usb, int ep);
-int open_camera (int busn, int devn, short force, PTP_USB *ptp_usb, PTPParams *params, struct usb_device **dev);
-void close_camera (PTP_USB *ptp_usb, PTPParams *params, struct usb_device *dev);
+int open_camera (int busn, int devn, short force, PTP_USB *ptp_usb, PTPParams *params, libusb_device **dev);
+void close_camera (PTP_USB *ptp_usb, PTPParams *params, libusb_device *dev);
 
 #endif /* __PTPCAM_H__ */
