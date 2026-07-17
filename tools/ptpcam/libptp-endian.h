@@ -9,6 +9,11 @@
 #else
 /* ntohl and relatives live here */
 #include <arpa/inet.h>
+#if defined(__linux__)
+#include <endian.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/endian.h>
+#endif
 
 /* Define generic byte swapping functions */
 #if HAVE_BYTESWAP_H

@@ -52,7 +52,7 @@
 int
 ptp_property_issupported(PTPParams* params, uint16_t property)
 {
-	int i=0;
+	uint32_t i=0;
 
 	for (;i<params->deviceinfo.DevicePropertiesSupported_len;i++) {
 		if (params->deviceinfo.DevicePropertiesSupported[i]==property)
@@ -380,14 +380,14 @@ ptp_prop_getdescscale1000(PTPParams* params, PTPDevicePropDesc *dpd, char* strva
 		int prec;
 	} prop_units[] = {
 		{PTP_DPC_ExposureBiasCompensation, N_(""),1},
-		{0, NULL}
+		{0, NULL, 0}
 	};
 	static struct {
 		uint16_t dpc;
 		const char *units;
 		int prec;
 	} prop_units_NIKON[] = {
-		{0, NULL}
+		{0, NULL, 0}
 	};
 
 	switch (params->deviceinfo.VendorExtensionID) {
@@ -429,7 +429,7 @@ ptp_prop_getdescscale100(PTPParams* params, PTPDevicePropDesc *dpd, char* strval
 	} prop_units[] = {
 		{PTP_DPC_FNumber, N_(""),1},
 		{PTP_DPC_FocalLength, N_("mm"),0},
-		{0, NULL}
+		{0, NULL, 0}
 	};
 	static struct {
 		uint16_t dpc;
@@ -440,7 +440,7 @@ ptp_prop_getdescscale100(PTPParams* params, PTPDevicePropDesc *dpd, char* strval
 		{PTP_DPC_NIKON_FocalLengthMax, N_(""),0},
 		{PTP_DPC_NIKON_MaxApAtMinFocalLength, N_(""),1},
 		{PTP_DPC_NIKON_MaxApAtMaxFocalLength, N_(""),1},
-		{0, NULL}
+		{0, NULL, 0}
 	};
 
 	switch (params->deviceinfo.VendorExtensionID) {
@@ -769,6 +769,8 @@ static struct {
 
 
 /* return property value description */
+/* Function pointer type for property value formatter functions */
+typedef const char* (*ptp_prop_formatter_func)(PTPParams*, PTPDevicePropDesc*, const char*);
 #define RETPROPDESC(desc)	\
 	{\
 		for (i=0; desc[i].dpc!=0; i++)	{ \
@@ -779,7 +781,7 @@ static struct {
 			} \
 			else {\
 				if (desc[i].dpc==dpd->DevicePropertyCode) \
-					return (((const char* (*) ()) desc[i].val) (params, dpd, strval)); \
+					return (((ptp_prop_formatter_func) desc[i].val) (params, dpd, strval)); \
 			}\
 		}	\
 	}

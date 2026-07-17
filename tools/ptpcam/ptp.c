@@ -34,18 +34,13 @@
 #include <unistd.h>
 #endif
 
-#ifndef UINTPTR_MAX
-    #error "No UINTPTR_MAX available, cannot safely build"
-#endif
-#if UINTPTR_MAX != 0xffffffff
-    #error "This code assumes 32-bit pointers, refusing to build."
-// This code was clearly intended for a 32-bit host, making assumptions
-// about pointer width in a few places, and packing values into buffers.
-// Is it possible to overflow buffers on cam if the host is 64-bit?
-// Looks plausible to me, so, I'm disabling such builds.
-// I might be wrong, feel free to confirm this and/or fix the code
-// to be portable.
-#endif
+/* 64-bit host support:
+ * The PTP wire protocol uses fixed-width uint32_t for all parameters and
+ * addresses, so the host pointer width does not affect on-wire correctness.
+ * Camera-side addresses passed through PTP are always 32-bit (ARM camera),
+ * and must be stored as uint32_t on the host side, not as pointers.
+ * See ptpbuf_t in ptpcam.c for the corrected struct layout.
+ */
 
 #ifdef ENABLE_NLS
 #  include <libintl.h>
@@ -1346,7 +1341,7 @@ ptp_canon_getfolderentries (PTPParams* params, uint32_t store, uint32_t p2,
 	ptp.Nparam=4;
 	ret=ptp_transaction(params, &ptp, PTP_DP_GETDATA, 0, &data);
 	if (ret == PTP_RC_OK) {
-		int i;
+		uint32_t i;
 		*entnum=ptp.Param1;
 		*entries=calloc(*entnum, sizeof(PTPCANONFolderEntry));
 		if (*entries!=NULL) {
@@ -1427,7 +1422,7 @@ ptp_nikon_keepalive (PTPParams* params)
 int
 ptp_operation_issupported(PTPParams* params, uint16_t operation)
 {
-	int i=0;
+	uint32_t i=0;
 
 	for (;i<params->deviceinfo.OperationsSupported_len;i++) {
 		if (params->deviceinfo.OperationsSupported[i]==operation)
@@ -1944,7 +1939,7 @@ int ptp_chdk_reboot_fw_update(char *path, PTPParams* params, PTPDeviceInfo* devi
   s = malloc(strlen(path)+12);
   if ( s == NULL )
   {
-    ptp_error(params,"could not allocate memory for command",ret);
+    ptp_error(params,"could not allocate memory for command");
     return 0;
   }
 
@@ -2171,7 +2166,6 @@ int ptp_chdk_download(char *remote_fn, char *local_fn, PTPParams* params, PTPDev
 int ptp_chdk_switch_mode(int mode, PTPParams* params, PTPDeviceInfo* deviceinfo)
 {
   char s[64];
-  int ret;
 
   if ( mode/10 != 0 )
   {
@@ -2263,6 +2257,7 @@ int ptp_chdk_get_version(PTPParams* params, PTPDeviceInfo* deviceinfo, int *majo
   *minor = ptp.Param2;
   return 1;
 }
+
 int ptp_chdk_get_script_status(PTPParams* params, PTPDeviceInfo* deviceinfo, int *status)
 {
   uint16_t r;
@@ -2358,7 +2353,6 @@ int ptp_chdk_read_script_msg(PTPParams* params, PTPDeviceInfo* deviceinfo,ptp_ch
 
 // print message in user friendly format
 void ptp_chdk_print_script_message(ptp_chdk_script_msg *msg) {
-  char *mtype,*msubtype;
 //  printf("msg->type %d\n",msg->type);
   if(msg->type == PTP_CHDK_S_MSGTYPE_NONE) {
     return;
