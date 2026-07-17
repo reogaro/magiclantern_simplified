@@ -40,9 +40,14 @@ brew install libusb pkg-config
 ```
 
 On Windows (MSYS2/MinGW64):
+
+For Windows: install MSYS2 and use "MSYS2 MinGW 64-bit" for compiling:
+
 ```bash
-pacman -S mingw-w64-x86_64-libusb mingw-w64-x86_64-pkgconf
+pacman -S mingw-w64-x86_64-libusb mingw-w64-x86_64-pkgconf mingw-w64-x86_64-gcc make
 ```
+
+Windows users will need to use Zadig (or similar tools) to replace the camera's default driver with the WinUSB driver.
 
 ## Build
 

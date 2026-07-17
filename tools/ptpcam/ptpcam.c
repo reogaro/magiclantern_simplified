@@ -88,10 +88,17 @@
 /* libusb-1.0 context */
 static libusb_context *ctx = NULL;
 
-/* OUR APPLICATION USB URB (2MB) ;) */
-#define PTPCAM_USB_URB		2097152
+/* OUR APPLICATION USB URB (512KB) ;) 
+ * Reduced from 2MB to 512KB to ensure compatibility with Windows WinUSB limits. */
+#define PTPCAM_USB_URB		524288
 
+#ifdef WIN32
+/* Windows WinUSB driver can experience latency/timeouts during large bulk
+ * transfers (like CR2 downloads), so we use a larger timeout on Windows. */
+#define USB_TIMEOUT		20000
+#else
 #define USB_TIMEOUT		5000
+#endif
 #define USB_CAPTURE_TIMEOUT	20000
 
 /* one global variable (yes, I know it sucks) */
@@ -782,7 +789,7 @@ download:
 				goto out;
 		filename=(oi.Filename);
 #ifdef WIN32
-                goto out;
+		file=open(filename, (overwrite==OVERWRITE_EXISTING?0:O_EXCL)|O_WRONLY|O_CREAT|O_TRUNC|O_BINARY, 0666);
 #else
 		file=open(filename, (overwrite==OVERWRITE_EXISTING?0:O_EXCL)|O_RDWR|O_CREAT|O_TRUNC,S_IRWXU|S_IRGRP);
 #endif
@@ -794,13 +801,13 @@ download:
 			perror("open");
 			goto out;
 		}
+#ifndef WIN32
 		lseek(file,oi.ObjectCompressedSize-1,SEEK_SET);
 		ret=write(file,"",1);
 		if (ret==-1) {
 			perror("write");
 			goto out;
 		}
-#ifndef WIN32
 		image=mmap(0,oi.ObjectCompressedSize,PROT_READ|PROT_WRITE,MAP_SHARED,
 			file,0);
 		if (image==MAP_FAILED) {
@@ -811,8 +818,18 @@ download:
 #endif
 		printf ("Saving file: \"%s\" ",filename);
 		fflush(NULL);
+		image = NULL;
 		ret=ptp_getobject(&params,handle,&image);
+#ifndef WIN32
 		munmap(image,oi.ObjectCompressedSize);
+#else
+		if (ret == PTP_RC_OK && image != NULL) {
+			write(file, image, oi.ObjectCompressedSize);
+		}
+		if (image != NULL) {
+			free(image);
+		}
+#endif
 		close(file);
 		if (ret!=PTP_RC_OK) {
 			printf ("error!\n");
@@ -1266,12 +1283,12 @@ void
 save_object(PTPParams *params, uint32_t handle, char* filename, PTPObjectInfo oi, int overwrite)
 {
 	int file;
-	char *image;
+	char *image = NULL;
 	int ret;
 	struct utimbuf timebuf;
 
 #ifdef WIN32
-        goto out;
+	file=open(filename, (overwrite==OVERWRITE_EXISTING?0:O_EXCL)|O_WRONLY|O_CREAT|O_TRUNC|O_BINARY, 0666);
 #else
 	file=open(filename, (overwrite==OVERWRITE_EXISTING?0:O_EXCL)|O_RDWR|O_CREAT|O_TRUNC,S_IRWXU|S_IRGRP);
 #endif
@@ -1283,13 +1300,13 @@ save_object(PTPParams *params, uint32_t handle, char* filename, PTPObjectInfo oi
 		perror("open");
 		goto out;
 	}
+#ifndef WIN32
 	lseek(file,oi.ObjectCompressedSize-1,SEEK_SET);
 	ret=write(file,"",1);
 	if (ret==-1) {
 	    perror("write");
 	    goto out;
 	}
-#ifndef WIN32
 	image=mmap(0,oi.ObjectCompressedSize,PROT_READ|PROT_WRITE,MAP_SHARED,
 		file,0);
 	if (image==MAP_FAILED) {
@@ -1301,7 +1318,16 @@ save_object(PTPParams *params, uint32_t handle, char* filename, PTPObjectInfo oi
 	printf ("Saving file: \"%s\" ",filename);
 	fflush(NULL);
 	ret=ptp_getobject(params,handle,&image);
+#ifndef WIN32
 	munmap(image,oi.ObjectCompressedSize);
+#else
+	if (ret == PTP_RC_OK && image != NULL) {
+		write(file, image, oi.ObjectCompressedSize);
+	}
+	if (image != NULL) {
+		free(image);
+	}
+#endif
 	if (close(file)==-1) {
 	    perror("close");
 	}
@@ -1514,7 +1540,7 @@ set_property (PTPParams* params,
 		break;
 	case PTP_DTC_UINT8:
 		val=malloc(sizeof(uint8_t));
-		*(uint8_t*)val=(uint8_t)strtol(value,NULL,0);
+		*(uint8_t*)val=(uint8_t)strtoul(value,NULL,0);
 		break;
 	case PTP_DTC_INT16:
 		val=malloc(sizeof(int16_t));
@@ -1522,7 +1548,7 @@ set_property (PTPParams* params,
 		break;
 	case PTP_DTC_UINT16:
 		val=malloc(sizeof(uint16_t));
-		*(uint16_t*)val=(uint16_t)strtol(value,NULL,0);
+		*(uint16_t*)val=(uint16_t)strtoul(value,NULL,0);
 		break;
 	case PTP_DTC_INT32:
 		val=malloc(sizeof(int32_t));
@@ -1530,7 +1556,7 @@ set_property (PTPParams* params,
 		break;
 	case PTP_DTC_UINT32:
 		val=malloc(sizeof(uint32_t));
-		*(uint32_t*)val=(uint32_t)strtol(value,NULL,0);
+		*(uint32_t*)val=(uint32_t)strtoul(value,NULL,0);
 		break;
 	case PTP_DTC_STR:
 		val=(void *)value;
@@ -2193,7 +2219,7 @@ main(int argc, char ** argv)
 			break;
 		case 's':
 			action=ACT_GETSET_PROPERTY;
-			property=strtol(optarg,NULL,16);
+			property=strtoul(optarg,NULL,16);
 			break;
 		case 'o':
 			action=ACT_LIST_OPERATIONS;
@@ -2209,14 +2235,14 @@ main(int argc, char ** argv)
 			break;
 		case 'g':
 			action=ACT_GET_FILE;
-			handle=strtol(optarg,NULL,16);
+			handle=strtoul(optarg,NULL,16);
 			break;
 		case 'G':
 			action=ACT_GET_ALL_FILES;
 			break;
 		case 'd':
 			action=ACT_DELETE_OBJECT;
-			handle=strtol(optarg,NULL,16);
+			handle=strtoul(optarg,NULL,16);
 			break;
 		case 'D':
 			action=ACT_DELETE_ALL_FILES;
@@ -2524,11 +2550,19 @@ void adtg_dump(unsigned char * data_buf, unsigned int length, int addr)
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+typedef int SOCKET;
+#else
+#include <winsock2.h>
+typedef int socklen_t;
+#define MSG_DONTWAIT 0
 #endif
+
+#ifndef INVALID_SOCKET
 #define INVALID_SOCKET -1
+#endif
 int gdb_port = 23946;
 
-int accepttimeout ( int s, struct sockaddr *addr, int *addrlen, int timeout )
+SOCKET accepttimeout ( SOCKET s, struct sockaddr *addr, int *addrlen, int timeout )
 {
     fd_set fds;
     int n;
@@ -2544,15 +2578,14 @@ int accepttimeout ( int s, struct sockaddr *addr, int *addrlen, int timeout )
 
     // wait until timeout or data received
     n = select(s+1, &fds, NULL, NULL, &tv);
-    if (n == 0) return -2; // timeout!
-    if (n == -1) return -1; // error
+    if (n <= 0) return INVALID_SOCKET; // timeout or error
 
-    // data must be here, so do a normal recv()
+    // data must be here, so do a normal accept()
     return accept ( s, addr, (socklen_t *)addrlen );
 }
 
 
-int recvtimeout ( int s, char *buf, int len, int timeout )
+int recvtimeout ( SOCKET s, char *buf, int len, int timeout )
 {
     fd_set fds;
     int n;
@@ -2576,7 +2609,7 @@ int recvtimeout ( int s, char *buf, int len, int timeout )
 }
 
 
-void gdb_loop (int socket)
+void gdb_loop (SOCKET socket)
 {
     char buffer[8192];
     while(1)
@@ -2628,10 +2661,14 @@ unsigned int gdb_listen ( )
     struct sockaddr_in local;
     struct sockaddr_in remote;
     int remotelen = sizeof ( remote );
-    int server_fd = INVALID_SOCKET;
-    int client_fd = INVALID_SOCKET;
+    SOCKET server_fd = INVALID_SOCKET;
+    SOCKET client_fd = INVALID_SOCKET;
 
-
+#ifdef WIN32
+    WSADATA gdb_wsadata;
+    if ( WSAStartup ( 0x101, &gdb_wsadata ) != 0 )
+        return E_FAIL;
+#endif
 
 	local.sin_family = AF_INET; 
 	local.sin_addr.s_addr = INADDR_ANY; 
@@ -2649,7 +2686,7 @@ unsigned int gdb_listen ( )
 		while ( 1 )
 		{
 			client_fd = accepttimeout ( server_fd, (struct sockaddr*)&remote, &remotelen, 500 );
-			if ( client_fd >= 0 )
+			if ( client_fd != INVALID_SOCKET )
 			{
 				close ( server_fd );
 				printf ("remote connected: %s\n", inet_ntoa ( remote.sin_addr )  );

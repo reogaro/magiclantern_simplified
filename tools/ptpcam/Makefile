@@ -4,6 +4,10 @@ CC=gcc
 CFLAGS=-Wall -Wextra -Wno-unused-parameter $(shell pkg-config --cflags libusb-1.0)
 LDFLAGS=$(shell pkg-config --libs libusb-1.0)
 
+ifeq ($(OS),Windows_NT)
+LDFLAGS += -lws2_32
+endif
+
 all: ptpcam
 
 clean:
