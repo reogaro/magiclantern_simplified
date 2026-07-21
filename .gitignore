@@ -76,5 +76,6 @@ modules/*/build
 modules/*/*/build
 developer_guide/developer_guide.html
 developer_guide/developer_guide.pdf
+tools/ptpcam/ptpcam
 
 syntax: regexp

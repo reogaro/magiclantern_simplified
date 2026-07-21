@@ -1,9 +1,25 @@
-requires libusb (windows version included)
+# ptpcam
 
-Changelog:
+ptpcam is a tool to interact with connected cameras via the Picture Transfer Protocol.
+
+## Compiling
+
+ptpcam was written for 32-bit processors and requires 32-bit dependencies:
+
+**Fedora**:
+```bash
+sudo dnf install glibc-devel.i686 libusb-compat-0.1-devel.i686 libatomic.i686
+```
+
+## Changelog
+
  - Modified by g3gg0 for MagicLantern GDB stubs
  - Minor build fixes by nanomad
+ - Somewhat modernized by reogaro
 
-Notes:
- - Makefile.win32 is for cygwin under windows
- - ../patches/ptpcam-ml.patch is the original patch from g3gg0
+## Windows Support
+
+Support for windows systems has likely decayed and is currently untested.
+
+Makefile.win32 is for cygwin under windows. Legacy windows libusb is still in this folder.
+
